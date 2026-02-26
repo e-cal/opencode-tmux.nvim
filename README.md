@@ -13,15 +13,27 @@ It adds tmux-oriented server behavior:
 
 ## Setup
 
+Use `lazy.nvim` and load this plugin as a dependency of `opencode.nvim`:
+
 ```lua
-require("opencode-tmux").setup({
-  options = "-h",
-  focus = false,
-  auto_close = false,
-  allow_passthrough = false,
-  find_sibling = true,
-})
+{
+  "nickvandyke/opencode.nvim",
+  dependencies = {
+    {
+      "e-cal/opencode-tmux.nvim",
+      opts = {
+        options = "-h",
+        focus = false,
+        auto_close = false,
+        allow_passthrough = false,
+        find_sibling = true,
+      },
+    },
+  },
+}
 ```
+
+All default options are defined in `lua/opencode-tmux/config.lua`.
 
 ## Options
 

@@ -1,6 +1,7 @@
 local state = require("opencode-tmux.state")
 local tmux = require("opencode-tmux.tmux")
 local patch = require("opencode-tmux.patch")
+local config = require("opencode-tmux.config")
 
 local M = {}
 
@@ -15,20 +16,20 @@ local M = {}
 
 ---@param opts? opencode_tmux.Opts
 function M.setup(opts)
-	state.opts = vim.tbl_deep_extend("force", state.opts, opts or {})
+	state.opts = config.setup(opts)
 	if state.opts.enabled == false then
 		return
 	end
 
-	local ok, config = pcall(require, "opencode.config")
+	local ok, opencode_config = pcall(require, "opencode.config")
 	if not ok then
 		return
 	end
 
-	config.opts.server = config.opts.server or {}
-	config.opts.server.start = tmux.start
-	config.opts.server.stop = tmux.stop
-	config.opts.server.toggle = tmux.toggle
+	opencode_config.opts.server = opencode_config.opts.server or {}
+	opencode_config.opts.server.start = tmux.start
+	opencode_config.opts.server.stop = tmux.stop
+	opencode_config.opts.server.toggle = tmux.toggle
 
 	patch.apply()
 end

@@ -1,14 +1,7 @@
 local M = {}
+local config = require("opencode-tmux.config")
 
-M.opts = {
-	enabled = true,
-	cmd = "opencode --port",
-	options = "-h",
-	focus = false,
-	allow_passthrough = false,
-	auto_close = false,
-	find_sibling = true,
-}
+M.opts = vim.deepcopy(config.defaults)
 
 M.pane_id = nil
 M.patched = false
