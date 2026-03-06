@@ -108,6 +108,7 @@ function M.clean_up_stash_session()
 	end
 end
 
+---@param pane_id string
 function M.auto_toggle(pane_id)
 	if not state.hidden_pane_spec then -- Hide pane
 		-- Check if stash session exists
