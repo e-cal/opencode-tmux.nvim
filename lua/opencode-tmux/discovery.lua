@@ -4,25 +4,75 @@ local tmux = require("opencode-tmux.tmux")
 
 local M = {}
 
----@param s string
----@return string
-local function trim(s)
-	return (s:gsub("^%s+", ""):gsub("%s+$", ""))
-end
-
 ---@param args string
 ---@return string|nil
-local function parse_session_id_from_args(args)
-	local session_id = args:match("%-%-session=([%w%-%_]+)")
-		or args:match("%-%-session%s+([%w%-%_]+)")
-		or args:match("%-s=([%w%-%_]+)")
-		or args:match("%-s%s+([%w%-%_]+)")
+local function parse_dir_from_args(args)
+	return args:match("%-%-dir=([^%s]+)") or args:match("%-%-dir%s+([^%s]+)")
+end
 
-	if session_id and session_id:match("^ses") then
-		return session_id
+---Query the server for the most recently updated session in the given directory.
+---Calls callback with the session table, or nil if none found.
+---@param port number
+---@param directory string
+---@param callback fun(session: opencode.cli.client.Session|nil)
+local function get_session_for_dir(port, directory, callback)
+	local encoded = directory:gsub("([^%w%-_%.~/])", function(c)
+		return string.format("%%%02X", string.byte(c))
+	end)
+	local path = "/session?directory=" .. encoded .. "&limit=1"
+	local command = {
+		"curl", "-s", "-X", "GET",
+		"-H", "Accept: application/json",
+		"--max-time", "2",
+		"http://localhost:" .. tostring(port) .. path,
+	}
+	local stdout_buf = {}
+	local done = false
+	vim.fn.jobstart(command, {
+		on_stdout = function(_, data)
+			if not data then return end
+			for _, line in ipairs(data) do
+				if line ~= "" then table.insert(stdout_buf, line) end
+			end
+		end,
+		on_exit = function(_, code)
+			if done then return end
+			done = true
+			if code ~= 0 then
+				vim.schedule(function() callback(nil) end)
+				return
+			end
+			local raw = table.concat(stdout_buf, "")
+			local ok, sessions = pcall(vim.fn.json_decode, raw)
+			if ok and type(sessions) == "table" and #sessions > 0 then
+				vim.schedule(function() callback(sessions[1]) end)
+			else
+				vim.schedule(function() callback(nil) end)
+			end
+		end,
+	})
+end
+
+---Find the --dir used by the attach process for a given port by scanning ps output.
+---Falls back to server_cwd if not found.
+---@param port number
+---@param server_cwd string
+---@return string
+local function get_client_dir_for_port(port, server_cwd)
+	local process_lines = system.run_lines({ "ps", "-eo", "pid=,args=" })
+	for _, process in ipairs(process_lines) do
+		local _, args = process:match("^%s*(%d+)%s+(.+)$")
+		if args and args:find("opencode", 1, true) then
+			local attach_port = args:match("%-%-attach=.-:(%d+)") or args:match("attach%s+.-:(%d+)")
+			if tonumber(attach_port) == port then
+				local dir = parse_dir_from_args(args)
+				if dir then
+					return dir
+				end
+			end
+		end
 	end
-
-	return nil
+	return server_cwd
 end
 
 ---@param args string
@@ -62,54 +112,6 @@ local function process_matches_port(pid, args, port)
 	end
 
 	return false
-end
-
----@param pane_title string
----@return string|nil
-local function parse_session_hint_from_pane_title(pane_title)
-	pane_title = trim(pane_title)
-	if pane_title == "" or pane_title == "OpenCode" then
-		return nil
-	end
-
-	local hint = pane_title:match("^OC%s*|%s*(.+)$") or pane_title
-	hint = trim(hint)
-	if hint == "" or hint == "OpenCode" then
-		return nil
-	end
-
-	return hint
-end
-
----@param hint string
----@param sessions opencode.cli.client.Session[]
----@return string|nil
-local function match_session_id_by_title_hint(hint, sessions)
-	if hint == "" then
-		return nil
-	end
-
-	local matches = {}
-	if hint:sub(-3) == "..." then
-		local prefix = hint:sub(1, -4)
-		for _, session in ipairs(sessions) do
-			if session.title and session.title:find(prefix, 1, true) == 1 then
-				table.insert(matches, session)
-			end
-		end
-	else
-		for _, session in ipairs(sessions) do
-			if session.title == hint then
-				table.insert(matches, session)
-			end
-		end
-	end
-
-	if #matches == 1 then
-		return matches[1].id
-	end
-
-	return nil
 end
 
 ---@return number[]
@@ -184,69 +186,51 @@ function M.sibling_ports()
 	return ports
 end
 
+---Find candidates for a sibling opencode process on the given port within the current tmux window.
+---Returns a list sorted by pane proximity, each with pid/tty/args/pane_index.
 ---@param port number
----@param sessions opencode.cli.client.Session[]
----@return string|nil
-function M.session_id_for_port(port, sessions)
-	if not system.in_tmux() or state.opts.find_sibling ~= true then
-		return nil
-	end
-	if not sessions or #sessions == 0 then
-		return nil
-	end
-
+---@return table[]
+local function sibling_candidates_for_port(port)
 	local current_pane = tmux.current_pane_id()
-	if not current_pane then
-		return nil
-	end
+	if not current_pane then return {} end
 
 	local current_loc = system.run({ "tmux", "display-message", "-p", "#{session_name}:#{window_index}.#{pane_index}" })
-	if current_loc == "" then
-		return nil
-	end
+	if current_loc == "" then return {} end
 	local current_window = current_loc:match("^([^%.]+)")
-	if not current_window then
-		return nil
-	end
+	if not current_window then return {} end
 
 	local tty_to_tmux = {}
 	local pane_to_tmux = {}
-	local tty_to_title = {}
 	local pane_lines = system.run_lines({
-		"tmux",
-		"list-panes",
-		"-a",
-		"-F",
-		"#{pane_id}\t#{pane_tty}\t#{session_name}:#{window_index}.#{pane_index}\t#{pane_title}",
+		"tmux", "list-panes", "-a", "-F",
+		"#{pane_id}\t#{pane_tty}\t#{session_name}:#{window_index}.#{pane_index}",
 	})
 	for _, line in ipairs(pane_lines) do
-		local pane_id, pane_tty, pane_loc, pane_title = line:match("^(%%%d+)\t([^\t]+)\t([^\t]+)\t(.*)$")
+		local pane_id, pane_tty, pane_loc = line:match("^(%%%d+)\t([^\t]+)\t([^\t]+)$")
 		if pane_id and pane_tty and pane_loc then
 			local tty = pane_tty:gsub("^/dev/", "")
 			tty_to_tmux[tty] = pane_loc
 			pane_to_tmux[pane_id] = pane_loc
-			tty_to_title[tty] = pane_title or ""
 		end
 	end
 
 	local current_pane_index = tonumber(current_loc:match("%.(%d+)$") or "") or 0
 	local tty_to_pane_index = {}
 	for _, line in ipairs(pane_lines) do
-		local pane_id, pane_tty, pane_loc = line:match("^(%%%d+)\t([^\t]+)\t([^\t]+)\t.*$")
-		if pane_id and pane_tty and pane_loc then
+		local _, pane_tty, pane_loc = line:match("^(%%%d+)\t([^\t]+)\t([^\t]+)$")
+		if pane_tty and pane_loc then
 			local tty = pane_tty:gsub("^/dev/", "")
 			tty_to_pane_index[tty] = tonumber(pane_loc:match("%.(%d+)$") or "")
 		end
 	end
 
-	local process_lines = system.run_lines({ "ps", "-eo", "pid=,tty=,args=" })
 	local candidates = {}
+	local process_lines = system.run_lines({ "ps", "-eo", "pid=,tty=,args=" })
 	for _, process in ipairs(process_lines) do
 		local pid, tty, args = process:match("^%s*(%d+)%s+(%S+)%s+(.+)$")
 		if pid and tty and args and args:find("opencode", 1, true) and tty ~= "??" then
 			local pane_loc = tty_to_tmux[tty]
-			if
-				pane_loc
+			if pane_loc
 				and pane_loc:find(current_window .. ".", 1, true) == 1
 				and pane_to_tmux[current_pane] ~= pane_loc
 			then
@@ -255,7 +239,6 @@ function M.session_id_for_port(port, sessions)
 						pid = pid,
 						tty = tty,
 						args = args,
-						pane_title = tty_to_title[tty] or "",
 						pane_index = tty_to_pane_index[tty] or 0,
 					})
 				end
@@ -264,30 +247,50 @@ function M.session_id_for_port(port, sessions)
 	end
 
 	table.sort(candidates, function(a, b)
-		local a_distance = math.abs((a.pane_index or 0) - current_pane_index)
-		local b_distance = math.abs((b.pane_index or 0) - current_pane_index)
-		if a_distance ~= b_distance then
-			return a_distance < b_distance
-		end
+		local a_dist = math.abs((a.pane_index or 0) - current_pane_index)
+		local b_dist = math.abs((b.pane_index or 0) - current_pane_index)
+		if a_dist ~= b_dist then return a_dist < b_dist end
 		return (a.pane_index or 0) < (b.pane_index or 0)
 	end)
 
-	for _, candidate in ipairs(candidates) do
-		local session_id = parse_session_id_from_args(candidate.args)
-		if session_id then
-			return session_id
-		end
+	return candidates
+end
 
-		local pane_hint = parse_session_hint_from_pane_title(candidate.pane_title)
-		if pane_hint then
-			local matched_session_id = match_session_id_by_title_hint(pane_hint, sessions)
-			if matched_session_id then
-				return matched_session_id
+---@param pid string
+---@return string|nil
+local function get_process_cwd(pid)
+	local lines = system.run_lines({ "lsof", "-a", "-p", pid, "-d", "cwd", "-Fn" })
+	for _, line in ipairs(lines) do
+		if line:sub(1, 1) == "n" then
+			local cwd = line:sub(2)
+			if cwd ~= "" then
+				return cwd
 			end
 		end
 	end
-
 	return nil
+end
+
+---Resolve the target directory for a sibling opencode client on the given port.
+---Prefers --dir from process args, then process cwd, then fallback_directory.
+---@param port number
+---@param fallback_directory string
+---@param callback fun(directory: string)
+function M.target_directory_for_port_async(port, fallback_directory, callback)
+	if not system.in_tmux() or state.opts.find_sibling ~= true then
+		callback(fallback_directory)
+		return
+	end
+
+	local candidates = sibling_candidates_for_port(port)
+	for _, candidate in ipairs(candidates) do
+		local dir = parse_dir_from_args(candidate.args) or get_process_cwd(candidate.pid)
+		if dir and dir ~= "" then
+			callback(dir)
+			return
+		end
+	end
+	callback(fallback_directory)
 end
 
 ---@param servers opencode.cli.server.Server[]
@@ -323,11 +326,12 @@ function M.get_server(port)
 		end)
 	end)
 		:next(function(cwd)
+			local client_dir = get_client_dir_for_port(port, cwd)
 			return Promise.all({
 				cwd,
 				Promise.new(function(resolve)
-					client.get_sessions(port, function(session)
-						local title = session[1] and session[1].title or "<No sessions>"
+					get_session_for_dir(port, client_dir, function(session)
+						local title = session and session.title or "<No sessions>"
 						resolve(title)
 					end)
 				end),
@@ -355,53 +359,27 @@ end
 ---@return Promise<opencode.cli.server.Server[]>
 function M.servers_from_ports(ports)
 	local Promise = require("opencode.promise")
-	local server = require("opencode.cli.server")
 
 	if #ports == 0 then
 		return Promise.resolve({})
 	end
 
-	local get_all = state.original_get_all or server.get_all
-	return get_all()
-		:catch(function()
-			return {}
-		end)
-		:next(function(existing_servers)
-			local discovered = {}
-			local existing_by_port = {}
+	-- Always use our own get_server which queries /session?directory=<client_dir>
+	-- to get the correct title for each sibling port.
+	local lookups = {}
+	for _, port in ipairs(ports) do
+		table.insert(lookups, M.get_server(port))
+	end
 
-			for _, server_item in ipairs(existing_servers) do
-				existing_by_port[server_item.port] = server_item
+	return Promise.all_settled(lookups):next(function(results)
+		local discovered = {}
+		for _, result in ipairs(results) do
+			if result.status == "fulfilled" then
+				table.insert(discovered, result.value)
 			end
-
-			local missing_ports = {}
-			for _, port in ipairs(ports) do
-				local existing = existing_by_port[port]
-				if existing then
-					table.insert(discovered, existing)
-				else
-					table.insert(missing_ports, port)
-				end
-			end
-
-			if #missing_ports == 0 then
-				return discovered
-			end
-
-			local lookups = {}
-			for _, port in ipairs(missing_ports) do
-				table.insert(lookups, M.get_server(port))
-			end
-
-			return Promise.all_settled(lookups):next(function(results)
-				for _, result in ipairs(results) do
-					if result.status == "fulfilled" then
-						table.insert(discovered, result.value)
-					end
-				end
-				return discovered
-			end)
-		end)
+		end
+		return discovered
+	end)
 end
 
 ---@return Promise<opencode.cli.server.Server[]>

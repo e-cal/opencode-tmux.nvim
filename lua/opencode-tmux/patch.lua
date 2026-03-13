@@ -4,20 +4,16 @@ local discovery = require("opencode-tmux.discovery")
 
 local M = {}
 
-local function send_message_and_ignore_timeout(port, session_id, text)
+---@param port number
+---@param endpoint string
+---@param directory string
+---@param body table|nil
+---@return Promise
+local function tui_post(port, endpoint, directory, body)
 	local Promise = require("opencode.promise")
 
-	return Promise.new(function(resolve)
+	return Promise.new(function(resolve, reject)
 		local stderr_lines = {}
-		local body = vim.fn.json_encode({
-			sessionID = session_id,
-			parts = {
-				{
-					type = "text",
-					text = text,
-				},
-			},
-		})
 
 		local command = {
 			"curl",
@@ -28,12 +24,18 @@ local function send_message_and_ignore_timeout(port, session_id, text)
 			"Content-Type: application/json",
 			"-H",
 			"Accept: application/json",
+			"-H",
+			"x-opencode-directory: " .. directory,
 			"--max-time",
 			"2",
-			"-d",
-			body,
-			"http://localhost:" .. port .. "/session/" .. session_id .. "/message",
 		}
+
+		if body then
+			table.insert(command, "-d")
+			table.insert(command, vim.fn.json_encode(body))
+		end
+
+		table.insert(command, "http://localhost:" .. tostring(port) .. endpoint)
 
 		vim.fn.jobstart(command, {
 			on_stderr = function(_, data)
@@ -47,46 +49,26 @@ local function send_message_and_ignore_timeout(port, session_id, text)
 				end
 			end,
 			on_exit = function(_, code)
-				if code == 0 or code == 28 then
+				if code == 0 then
 					resolve(true)
 					return
 				end
 				local stderr_message = #stderr_lines > 0 and table.concat(stderr_lines, "\n") or "<none>"
-				reject("Failed to send session message (" .. tostring(code) .. "): " .. stderr_message)
+				reject("Failed POST " .. endpoint .. " (" .. tostring(code) .. "): " .. stderr_message)
 			end,
 		})
 	end)
 end
 
-local function get_target_session(port)
+---@param port number
+---@param fallback_directory string
+---@return Promise
+local function get_target_directory(port, fallback_directory)
 	local Promise = require("opencode.promise")
-	local client = require("opencode.cli.client")
 
 	return Promise.new(function(resolve)
-		client.get_sessions(port, function(sessions)
-			if not sessions or #sessions == 0 then
-				system.debug("No sessions available on sibling server port " .. tostring(port))
-				resolve(nil)
-				return
-			end
-
-			local hinted_session_id = discovery.session_id_for_port(port, sessions)
-			if not hinted_session_id then
-				system.debug("No sibling pane session hint matched for port " .. tostring(port))
-				resolve(nil)
-				return
-			end
-
-			for _, session in ipairs(sessions) do
-				if session.id == hinted_session_id then
-					system.debug("Matched sibling pane to session " .. session.id .. " on port " .. tostring(port))
-					resolve(session)
-					return
-				end
-			end
-
-			system.debug("Sibling hinted session " .. hinted_session_id .. " not found on port " .. tostring(port))
-			resolve(nil)
+		discovery.target_directory_for_port_async(port, fallback_directory, function(directory)
+			resolve(directory)
 		end)
 	end)
 end
@@ -229,8 +211,8 @@ function M.apply()
 			context = opts and opts.context or require("opencode.context").new(),
 		}
 
-		if opts.submit ~= true or state.opts.find_sibling ~= true then
-			system.debug("Prompt submit routing disabled; using original prompt behavior")
+		if state.opts.find_sibling ~= true then
+			system.debug("Sibling routing disabled; using original prompt behavior")
 			return state.original_prompt(prompt_text, opts)
 		end
 
@@ -243,23 +225,48 @@ function M.apply()
 			end)
 			:next(function(server_item)
 				if not server_item then
-					system.debug("No server resolved for submit; falling back to original prompt")
+					system.debug("No server resolved; falling back to original prompt")
 					return state.original_prompt(prompt_text, opts)
 				end
 
-				return get_target_session(server_item.port):next(function(session)
-					if not session then
-						system.debug(
-							"No strict sibling session match on port " .. tostring(server_item.port) .. "; falling back to original prompt"
-						)
+				local rendered = opts.context:render(prompt_text, server_item.subagents)
+				local plaintext = opts.context.plaintext(rendered.output)
+
+				return get_target_directory(server_item.port, server_item.cwd):next(function(directory)
+					if not directory or directory == "" then
+						system.debug("No target directory resolved; falling back to original prompt")
 						return state.original_prompt(prompt_text, opts)
 					end
 
-					local rendered = opts.context:render(prompt_text, server_item.subagents)
-					local plaintext = opts.context.plaintext(rendered.output)
+					local chain = Promise.resolve(true)
 
-					return send_message_and_ignore_timeout(server_item.port, session.id, plaintext):next(function()
-						system.debug("Submitted prompt to sibling session " .. session.id .. " on port " .. tostring(server_item.port))
+					if opts.clear then
+						chain = chain:next(function()
+							return tui_post(server_item.port, "/tui/clear-prompt", directory, nil)
+						end)
+					end
+
+					if plaintext ~= "" then
+						chain = chain:next(function()
+							return tui_post(server_item.port, "/tui/append-prompt", directory, { text = plaintext })
+						end)
+					end
+
+					if opts.submit then
+						chain = chain:next(function()
+							return tui_post(server_item.port, "/tui/submit-prompt", directory, nil)
+						end)
+					end
+
+					return chain:next(function()
+						system.debug(
+							"Routed prompt via TUI endpoints on port "
+								.. tostring(server_item.port)
+								.. " directory="
+								.. directory
+								.. " submit="
+								.. tostring(opts.submit)
+						)
 						return server_item
 					end)
 				end)
