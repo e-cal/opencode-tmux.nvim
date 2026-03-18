@@ -104,9 +104,9 @@ function M.connect(opts)
 		return server_item
 	end)
 
-	promise:catch(function(err)
+	promise = promise:catch(function(err)
 		system.notify(tostring(err), vim.log.levels.ERROR)
-		return Promise.reject(err)
+		return nil
 	end)
 
 	return promise
@@ -190,6 +190,10 @@ function M.prompt(prompt_text, opts)
 
 	return M.connect({ launch = state.opts.connect_launch })
 		:next(function(server_item)
+			if not server_item then
+				return nil
+			end
+
 			local rendered = opts.context:render(prompt_text, server_item.subagents)
 			local plaintext = opts.context.plaintext(rendered.output)
 

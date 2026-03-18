@@ -273,9 +273,11 @@ function M.apply()
 
 		local function connect(server_item)
 			local connected_server = events.connected_server
-			local target_dir = discovery.target_directory_for_port(server_item.port, server_item.cwd)
+			local session_id, target_dir = discovery.resolve_target_session(server_item.port, server_item.cwd)
+			if not target_dir or target_dir == "" then
+				target_dir = server_item.cwd
+			end
 			state.sse_target_directory_by_port[server_item.port] = target_dir
-			local session_id = discovery.resolve_target_session(server_item.port, server_item.cwd)
 			state.sse_target_session_id_by_port[server_item.port] = session_id
 			system.debug(
 				"Resolved target"

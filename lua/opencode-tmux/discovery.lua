@@ -3,6 +3,7 @@ local system = require("opencode-tmux.system")
 local tmux = require("opencode-tmux.tmux")
 
 local M = {}
+local sibling_panes_by_tty
 
 ---@param name string
 ---@param args table|nil
@@ -135,12 +136,31 @@ end
 ---@return string
 local function get_client_dir_for_port(port, server_cwd)
 	debug_call("get_client_dir_for_port", { port = port, server_cwd = server_cwd })
-	local process_lines = system.run_lines({ "ps", "-eo", "pid=,args=" })
+	local pane_ctx = nil
+	if system.in_tmux() and state.opts.find_sibling == true and sibling_panes_by_tty then
+		pane_ctx = sibling_panes_by_tty()
+	end
+	local process_lines = system.run_lines({ "ps", "-eo", "pid=,tty=,args=" })
 	for _, process in ipairs(process_lines) do
-		local _, args = process:match("^%s*(%d+)%s+(.+)$")
+		local pid, tty, args = process:match("^%s*(%d+)%s+(%S+)%s+(.+)$")
 		if args and args:find("opencode", 1, true) then
 			local attach_port = args:match("%-%-attach=.-:(%d+)") or args:match("attach%s+.-:(%d+)")
-			if tonumber(attach_port) == port then
+			local attach_port_num = tonumber(attach_port)
+			local is_sibling_tty = pane_ctx == nil or (tty and tty ~= "??" and pane_ctx.siblings_by_tty[tty] ~= nil)
+			local pane_meta = pane_ctx and tty and pane_ctx.siblings_by_tty[tty] or nil
+			-- P({
+			-- 	fn = "get_client_dir_for_port:opencode_process",
+			-- 	pid = pid,
+			-- 	tty = tty,
+			-- 	args = args,
+			-- 	attach_port_raw = attach_port,
+			-- 	attach_port_num = attach_port_num,
+			-- 	target_port = port,
+			-- 	attach_matches_target = attach_port_num == port,
+			-- 	is_sibling_tty = is_sibling_tty,
+			-- 	pane_meta = pane_meta,
+			-- })
+			if attach_port_num == port and is_sibling_tty then
 				local dir = parse_dir_from_args(args)
 				if dir then
 					return dir
@@ -192,6 +212,52 @@ local function process_matches_port(pid, args, port)
 	return false
 end
 
+---Resolve sibling pane metadata for the current tmux window.
+---Returns nil when tmux context cannot be resolved.
+---@return { current_pane_index: number, siblings_by_tty: table<string, { pane_index: number, pane_title: string }> }|nil
+sibling_panes_by_tty = function()
+	local current_pane = tmux.current_pane_id()
+	if not current_pane then
+		return nil
+	end
+
+	local current_loc = system.run({ "tmux", "display-message", "-p", "#{session_name}:#{window_index}.#{pane_index}" })
+	if current_loc == "" then
+		return nil
+	end
+
+	local current_window = current_loc:match("^([^%.]+)")
+	if not current_window then
+		return nil
+	end
+
+	local siblings_by_tty = {}
+	local pane_lines = system.run_lines({
+		"tmux",
+		"list-panes",
+		"-t",
+		current_window,
+		"-F",
+		"#{pane_id}\t#{pane_tty}\t#{pane_index}\t#{pane_title}",
+	})
+
+	for _, line in ipairs(pane_lines) do
+		local pane_id, pane_tty, pane_index, pane_title = line:match("^(%%%d+)\t([^\t]+)\t([^\t]+)\t(.*)$")
+		if pane_id and pane_tty and pane_index and pane_id ~= current_pane then
+			local tty = pane_tty:gsub("^/dev/", "")
+			siblings_by_tty[tty] = {
+				pane_index = tonumber(pane_index) or 0,
+				pane_title = pane_title or "",
+			}
+		end
+	end
+
+	return {
+		current_pane_index = tonumber(current_loc:match("%.(%d+)$") or "") or 0,
+		siblings_by_tty = siblings_by_tty,
+	}
+end
+
 ---@return number[]
 function M.sibling_ports()
 	debug_call("sibling_ports", nil)
@@ -199,35 +265,9 @@ function M.sibling_ports()
 		return {}
 	end
 
-	local current_pane = tmux.current_pane_id()
-	if not current_pane then
+	local pane_ctx = sibling_panes_by_tty()
+	if not pane_ctx then
 		return {}
-	end
-
-	local current_loc = system.run({ "tmux", "display-message", "-p", "#{session_name}:#{window_index}.#{pane_index}" })
-	if current_loc == "" then
-		return {}
-	end
-	local current_window = current_loc:match("^([^%.]+)")
-	if not current_window then
-		return {}
-	end
-
-	local tty_to_tmux = {}
-	local pane_to_tmux = {}
-	local pane_lines = system.run_lines({
-		"tmux",
-		"list-panes",
-		"-a",
-		"-F",
-		"#{pane_id} #{pane_tty} #{session_name}:#{window_index}.#{pane_index}",
-	})
-	for _, line in ipairs(pane_lines) do
-		local pane_id, pane_tty, pane_loc = line:match("^(%%%d+)%s+([^%s]+)%s+([^%s]+)$")
-		if pane_id and pane_tty and pane_loc then
-			tty_to_tmux[pane_tty:gsub("^/dev/", "")] = pane_loc
-			pane_to_tmux[pane_id] = pane_loc
-		end
 	end
 
 	local seen = {}
@@ -236,32 +276,25 @@ function M.sibling_ports()
 	local process_lines = system.run_lines({ "ps", "-eo", "pid=,tty=,args=" })
 	for _, process in ipairs(process_lines) do
 		local pid, tty, args = process:match("^%s*(%d+)%s+(%S+)%s+(.+)$")
-		if pid and tty and args and args:find("opencode", 1, true) and tty ~= "??" then
-			local pane_loc = tty_to_tmux[tty]
-			if
-				pane_loc
-				and pane_loc:find(current_window .. ".", 1, true) == 1
-				and pane_to_tmux[current_pane] ~= pane_loc
-			then
-				local parsed_port = parse_target_port_from_args(args)
-				if parsed_port and not seen[parsed_port] then
-					seen[parsed_port] = true
-					table.insert(ports, parsed_port)
-				end
+		if pid and tty and args and tty ~= "??" and args:find("opencode", 1, true) and pane_ctx.siblings_by_tty[tty] then
+			local parsed_port = parse_target_port_from_args(args)
+			if parsed_port and not seen[parsed_port] then
+				seen[parsed_port] = true
+				table.insert(ports, parsed_port)
+			end
 
-				local lsof_lines =
-					system.run_lines({ "lsof", "-w", "-iTCP", "-sTCP:LISTEN", "-P", "-n", "-a", "-p", pid })
-				for _, lsof_line in ipairs(lsof_lines) do
-					local port = tonumber(lsof_line:match(":(%d+)%s*%(LISTEN%)"))
-					if port and not seen[port] then
-						seen[port] = true
-						table.insert(ports, port)
-					end
+			local lsof_lines = system.run_lines({ "lsof", "-w", "-iTCP", "-sTCP:LISTEN", "-P", "-n", "-a", "-p", pid })
+			for _, lsof_line in ipairs(lsof_lines) do
+				local port = tonumber(lsof_line:match(":(%d+)%s*%(LISTEN%)"))
+				if port and not seen[port] then
+					seen[port] = true
+					table.insert(ports, port)
 				end
 			end
 		end
 	end
 
+    system.debug("found ports: " .. table.concat(ports, ", "))
 	return ports
 end
 
@@ -271,52 +304,25 @@ end
 ---@return table[]
 local function sibling_candidates_for_port(port)
 	debug_call("sibling_candidates_for_port", { port = port })
-	local current_pane = tmux.current_pane_id()
-	if not current_pane then return {} end
-
-	local current_loc = system.run({ "tmux", "display-message", "-p", "#{session_name}:#{window_index}.#{pane_index}" })
-	if current_loc == "" then return {} end
-	local current_window = current_loc:match("^([^%.]+)")
-	if not current_window then return {} end
-
-	local tty_to_tmux = {}
-	local pane_to_tmux = {}
-	local tty_to_pane_index = {}
-	local tty_to_pane_title = {}
-	local pane_lines = system.run_lines({
-		"tmux", "list-panes", "-a", "-F",
-		"#{pane_id}\t#{pane_tty}\t#{session_name}:#{window_index}.#{pane_index}\t#{pane_title}",
-	})
-	for _, line in ipairs(pane_lines) do
-		local pane_id, pane_tty, pane_loc, pane_title = line:match("^(%%%d+)\t([^\t]+)\t([^\t]+)\t(.*)$")
-		if pane_id and pane_tty and pane_loc then
-			local tty = pane_tty:gsub("^/dev/", "")
-			tty_to_tmux[tty] = pane_loc
-			pane_to_tmux[pane_id] = pane_loc
-			tty_to_pane_index[tty] = tonumber(pane_loc:match("%.(%d+)$") or "")
-			tty_to_pane_title[tty] = pane_title or ""
-		end
+	local pane_ctx = sibling_panes_by_tty()
+	if not pane_ctx then
+		return {}
 	end
-
-	local current_pane_index = tonumber(current_loc:match("%.(%d+)$") or "") or 0
 
 	local candidates = {}
 	local process_lines = system.run_lines({ "ps", "-eo", "pid=,tty=,args=" })
 	for _, process in ipairs(process_lines) do
 		local pid, tty, args = process:match("^%s*(%d+)%s+(%S+)%s+(.+)$")
 		if pid and tty and args and args:find("opencode", 1, true) and tty ~= "??" then
-			local pane_loc = tty_to_tmux[tty]
-			if pane_loc
-				and pane_loc:find(current_window .. ".", 1, true) == 1
-				and pane_to_tmux[current_pane] ~= pane_loc
-			then
+			local pane_meta = pane_ctx.siblings_by_tty[tty]
+			if pane_meta then
 				if process_matches_port(pid, args, port) then
 					table.insert(candidates, {
 						pid = pid,
 						tty = tty,
 						args = args,
-						pane_index = tty_to_pane_index[tty] or 0,
-						pane_title = tty_to_pane_title[tty] or "",
+						pane_index = pane_meta.pane_index,
+						pane_title = pane_meta.pane_title,
 					})
 				end
 			end
@@ -324,13 +330,42 @@ local function sibling_candidates_for_port(port)
 	end
 
 	table.sort(candidates, function(a, b)
-		local a_dist = math.abs((a.pane_index or 0) - current_pane_index)
-		local b_dist = math.abs((b.pane_index or 0) - current_pane_index)
+		local a_dist = math.abs((a.pane_index or 0) - pane_ctx.current_pane_index)
+		local b_dist = math.abs((b.pane_index or 0) - pane_ctx.current_pane_index)
 		if a_dist ~= b_dist then return a_dist < b_dist end
 		return (a.pane_index or 0) < (b.pane_index or 0)
 	end)
-
 	return candidates
+end
+
+---@param pid string
+---@return string|nil
+local get_process_cwd
+
+---@param candidates table[]
+---@return string|nil
+local function sibling_pane_session_title_from_candidates(candidates)
+	for _, candidate in ipairs(candidates) do
+		local title = parse_session_title_from_pane(candidate.pane_title)
+		if title then
+			return title
+		end
+	end
+	return nil
+end
+
+---@param candidates table[]
+---@param fallback_directory string
+---@return string
+local function target_directory_from_candidates(candidates, fallback_directory)
+	for _, candidate in ipairs(candidates) do
+		local dir = parse_dir_from_args(candidate.args) or get_process_cwd(candidate.pid)
+		if dir and dir ~= "" then
+			return dir
+		end
+	end
+
+	return fallback_directory
 end
 
 ---Get the opencode session title from the closest sibling pane running opencode on this port.
@@ -343,19 +378,15 @@ local function sibling_pane_session_title(port)
 		return nil
 	end
 	local candidates = sibling_candidates_for_port(port)
-	for _, candidate in ipairs(candidates) do
-		local title = parse_session_title_from_pane(candidate.pane_title)
-		if title then
-			system.debug("Found sibling pane session title=" .. title .. " pane_title=" .. candidate.pane_title)
-			return title
-		end
+	local title = sibling_pane_session_title_from_candidates(candidates)
+	if title then
+		system.debug("Found sibling pane session title=" .. title)
+		return title
 	end
 	return nil
 end
 
----@param pid string
----@return string|nil
-local function get_process_cwd(pid)
+get_process_cwd = function(pid)
 	debug_call("get_process_cwd", { pid = pid })
 	local lines = system.run_lines({ "lsof", "-a", "-p", pid, "-d", "cwd", "-Fn" })
 	for _, line in ipairs(lines) do
@@ -381,14 +412,7 @@ function M.target_directory_for_port(port, fallback_directory)
 	end
 
 	local candidates = sibling_candidates_for_port(port)
-	for _, candidate in ipairs(candidates) do
-		local dir = parse_dir_from_args(candidate.args) or get_process_cwd(candidate.pid)
-		if dir and dir ~= "" then
-			return dir
-		end
-	end
-
-	return fallback_directory
+	return target_directory_from_candidates(candidates, fallback_directory)
 end
 
 ---Resolve the target directory for a sibling opencode client on the given port.
@@ -456,11 +480,16 @@ end
 ---@return string|nil directory
 function M.resolve_target_session(port, fallback_directory)
 	debug_call("resolve_target_session", { port = port, fallback_directory = fallback_directory })
-	local directory = M.target_directory_for_port(port, fallback_directory)
+	if not system.in_tmux() or state.opts.find_sibling ~= true then
+		return nil, fallback_directory
+	end
+
+	local candidates = sibling_candidates_for_port(port)
+	local directory = target_directory_from_candidates(candidates, fallback_directory)
 	if not directory or directory == "" then
 		return nil, nil
 	end
-	local title_hint = sibling_pane_session_title(port)
+	local title_hint = sibling_pane_session_title_from_candidates(candidates)
 	local session = get_session_for_dir_sync(port, directory, title_hint)
 	if session and session.id then
 		system.debug(
@@ -573,7 +602,8 @@ end
 ---@return Promise<opencode.cli.server.Server[]>
 function M.sibling_servers()
 	debug_call("sibling_servers", nil)
-	return M.servers_from_ports(M.sibling_ports())
+	local ports = M.sibling_ports()
+	return M.servers_from_ports(ports)
 end
 
 return M
