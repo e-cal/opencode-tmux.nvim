@@ -14,5 +14,6 @@ M.last_event_ms = nil
 M.last_event_type = nil
 M.sse_target_directory_by_port = {}
 M.sse_target_session_id_by_port = {}
+M.sse_target_pane_by_port = {}
 
 return M

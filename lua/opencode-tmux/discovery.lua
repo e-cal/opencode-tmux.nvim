@@ -67,9 +67,14 @@ local function get_session_for_dir_sync(port, directory, title_hint)
 	local limit = title_hint and 20 or 1
 	local path = "/session?directory=" .. encoded .. "&limit=" .. tostring(limit)
 	local result = vim.system({
-		"curl", "-s", "-X", "GET",
-		"-H", "Accept: application/json",
-		"--max-time", "2",
+		"curl",
+		"-s",
+		"-X",
+		"GET",
+		"-H",
+		"Accept: application/json",
+		"--max-time",
+		"2",
 		"http://localhost:" .. tostring(port) .. path,
 	}, { text = true }):wait()
 	if result.code ~= 0 or not result.stdout or result.stdout == "" then
@@ -97,33 +102,50 @@ local function get_session_for_dir(port, directory, callback, title_hint)
 	local limit = title_hint and 20 or 1
 	local path = "/session?directory=" .. encoded .. "&limit=" .. tostring(limit)
 	local command = {
-		"curl", "-s", "-X", "GET",
-		"-H", "Accept: application/json",
-		"--max-time", "2",
+		"curl",
+		"-s",
+		"-X",
+		"GET",
+		"-H",
+		"Accept: application/json",
+		"--max-time",
+		"2",
 		"http://localhost:" .. tostring(port) .. path,
 	}
 	local stdout_buf = {}
 	local done = false
 	vim.fn.jobstart(command, {
 		on_stdout = function(_, data)
-			if not data then return end
+			if not data then
+				return
+			end
 			for _, line in ipairs(data) do
-				if line ~= "" then table.insert(stdout_buf, line) end
+				if line ~= "" then
+					table.insert(stdout_buf, line)
+				end
 			end
 		end,
 		on_exit = function(_, code)
-			if done then return end
+			if done then
+				return
+			end
 			done = true
 			if code ~= 0 then
-				vim.schedule(function() callback(nil) end)
+				vim.schedule(function()
+					callback(nil)
+				end)
 				return
 			end
 			local raw = table.concat(stdout_buf, "")
 			local ok, sessions = pcall(vim.fn.json_decode, raw)
 			if ok and type(sessions) == "table" and #sessions > 0 then
-				vim.schedule(function() callback(best_session_by_title(sessions, title_hint)) end)
+				vim.schedule(function()
+					callback(best_session_by_title(sessions, title_hint))
+				end)
 			else
-				vim.schedule(function() callback(nil) end)
+				vim.schedule(function()
+					callback(nil)
+				end)
 			end
 		end,
 	})
@@ -214,7 +236,7 @@ end
 
 ---Resolve sibling pane metadata for the current tmux window.
 ---Returns nil when tmux context cannot be resolved.
----@return { current_pane_index: number, siblings_by_tty: table<string, { pane_index: number, pane_title: string }> }|nil
+---@return { current_pane_index: number, siblings_by_tty: table<string, { pane_id: string, pane_index: number, pane_title: string }> }|nil
 sibling_panes_by_tty = function()
 	local current_pane = tmux.current_pane_id()
 	if not current_pane then
@@ -246,6 +268,7 @@ sibling_panes_by_tty = function()
 		if pane_id and pane_tty and pane_index and pane_id ~= current_pane then
 			local tty = pane_tty:gsub("^/dev/", "")
 			siblings_by_tty[tty] = {
+				pane_id = pane_id,
 				pane_index = tonumber(pane_index) or 0,
 				pane_title = pane_title or "",
 			}
@@ -276,7 +299,14 @@ function M.sibling_ports()
 	local process_lines = system.run_lines({ "ps", "-eo", "pid=,tty=,args=" })
 	for _, process in ipairs(process_lines) do
 		local pid, tty, args = process:match("^%s*(%d+)%s+(%S+)%s+(.+)$")
-		if pid and tty and args and tty ~= "??" and args:find("opencode", 1, true) and pane_ctx.siblings_by_tty[tty] then
+		if
+			pid
+			and tty
+			and args
+			and tty ~= "??"
+			and args:find("opencode", 1, true)
+			and pane_ctx.siblings_by_tty[tty]
+		then
 			local parsed_port = parse_target_port_from_args(args)
 			if parsed_port and not seen[parsed_port] then
 				seen[parsed_port] = true
@@ -294,12 +324,12 @@ function M.sibling_ports()
 		end
 	end
 
-    system.debug("found ports: " .. table.concat(ports, ", "))
+	system.debug("found ports: " .. table.concat(ports, ", "))
 	return ports
 end
 
 ---Find candidates for a sibling opencode process on the given port within the current tmux window.
----Returns a list sorted by pane proximity, each with pid/tty/args/pane_index/pane_title.
+---Returns a list sorted by pane proximity, each with pid/tty/args/pane_id/pane_index/pane_title.
 ---@param port number
 ---@return table[]
 local function sibling_candidates_for_port(port)
@@ -321,6 +351,7 @@ local function sibling_candidates_for_port(port)
 						pid = pid,
 						tty = tty,
 						args = args,
+						pane_id = pane_meta.pane_id,
 						pane_index = pane_meta.pane_index,
 						pane_title = pane_meta.pane_title,
 					})
@@ -332,10 +363,107 @@ local function sibling_candidates_for_port(port)
 	table.sort(candidates, function(a, b)
 		local a_dist = math.abs((a.pane_index or 0) - pane_ctx.current_pane_index)
 		local b_dist = math.abs((b.pane_index or 0) - pane_ctx.current_pane_index)
-		if a_dist ~= b_dist then return a_dist < b_dist end
+		if a_dist ~= b_dist then
+			return a_dist < b_dist
+		end
 		return (a.pane_index or 0) < (b.pane_index or 0)
 	end)
 	return candidates
+end
+
+---@return table[]
+function M.sibling_pane_targets()
+	debug_call("sibling_pane_targets", nil)
+	if not system.in_tmux() or state.opts.find_sibling ~= true then
+		return {}
+	end
+
+	local pane_ctx = sibling_panes_by_tty()
+	if not pane_ctx then
+		return {}
+	end
+
+	local targets_by_pane = {}
+	local process_lines = system.run_lines({ "ps", "-eo", "pid=,tty=,args=" })
+	for _, process in ipairs(process_lines) do
+		local pid, tty, args = process:match("^%s*(%d+)%s+(%S+)%s+(.+)$")
+		if pid and tty and args and args:find("opencode", 1, true) and tty ~= "??" then
+			local pane_meta = pane_ctx.siblings_by_tty[tty]
+			if pane_meta then
+				local port = parse_target_port_from_args(args)
+				if not port then
+					local lsof_lines =
+						system.run_lines({ "lsof", "-w", "-iTCP", "-sTCP:LISTEN", "-P", "-n", "-a", "-p", pid })
+					for _, lsof_line in ipairs(lsof_lines) do
+						port = tonumber(lsof_line:match(":(%d+)%s*%(LISTEN%)"))
+						if port then
+							break
+						end
+					end
+				end
+
+				if port and not targets_by_pane[pane_meta.pane_id] then
+					targets_by_pane[pane_meta.pane_id] = {
+						pid = pid,
+						tty = tty,
+						args = args,
+						port = port,
+						pane_id = pane_meta.pane_id,
+						pane_index = pane_meta.pane_index,
+						pane_title = pane_meta.pane_title,
+					}
+				end
+			end
+		end
+	end
+
+	local targets = {}
+	for _, target in pairs(targets_by_pane) do
+		table.insert(targets, target)
+	end
+
+	table.sort(targets, function(a, b)
+		local a_dist = math.abs((a.pane_index or 0) - pane_ctx.current_pane_index)
+		local b_dist = math.abs((b.pane_index or 0) - pane_ctx.current_pane_index)
+		if a_dist ~= b_dist then
+			return a_dist < b_dist
+		end
+		return (a.pane_index or 0) < (b.pane_index or 0)
+	end)
+
+	return targets
+end
+
+---@param target table
+---@return string
+function M.format_pane_target_label(target)
+	debug_call("format_pane_target_label", { target = target })
+	local title = parse_session_title_from_pane(target and target.pane_title)
+	if not title or title == "" then
+		title = target and target.pane_title or nil
+	end
+	if not title or title == "" then
+		title = "opencode"
+	end
+	return string.format("[%d] %s", target and target.pane_index or 0, title)
+end
+
+---Resolve the best sibling tmux pane target for a port.
+---Uses the same candidate ordering as sibling process discovery.
+---@param port number
+---@return { pane_id: string, pane_index: number, pane_title: string, pid: string, tty: string, args: string }|nil
+function M.target_pane_for_port(port)
+	debug_call("target_pane_for_port", { port = port })
+	if not system.in_tmux() or state.opts.find_sibling ~= true then
+		return nil
+	end
+
+	local candidates = sibling_candidates_for_port(port)
+	if #candidates == 0 then
+		return nil
+	end
+
+	return candidates[1]
 end
 
 ---@param pid string
@@ -494,14 +622,47 @@ function M.resolve_target_session(port, fallback_directory)
 	if session and session.id then
 		system.debug(
 			"Resolved target session"
-				.. " port=" .. tostring(port)
-				.. " session=" .. tostring(session.id)
-				.. " title=" .. tostring(session.title)
-				.. " directory=" .. tostring(directory)
-				.. " title_hint=" .. tostring(title_hint)
+				.. " port="
+				.. tostring(port)
+				.. " session="
+				.. tostring(session.id)
+				.. " title="
+				.. tostring(session.title)
+				.. " directory="
+				.. tostring(directory)
+				.. " title_hint="
+				.. tostring(title_hint)
 		)
 		return session.id, directory
 	end
+	return nil, directory
+end
+
+---@param target table|nil
+---@param fallback_directory string
+---@return string|nil session_id
+---@return string|nil directory
+function M.resolve_target_session_for_pane(target, fallback_directory)
+	debug_call("resolve_target_session_for_pane", {
+		target = target,
+		fallback_directory = fallback_directory,
+	})
+	if not target then
+		return nil, fallback_directory
+	end
+
+	local candidates = { target }
+	local directory = target_directory_from_candidates(candidates, fallback_directory)
+	if not directory or directory == "" then
+		return nil, nil
+	end
+
+	local title_hint = sibling_pane_session_title_from_candidates(candidates)
+	local session = get_session_for_dir_sync(target.port, directory, title_hint)
+	if session and session.id then
+		return session.id, directory
+	end
+
 	return nil, directory
 end
 

@@ -4,40 +4,14 @@ local discovery = require("opencode-tmux.discovery")
 
 local M = {}
 
----@param port number
----@param endpoint string
----@param directory string
----@param body table|nil
+---@param pane_id string
+---@param key string
 ---@return Promise
-local function tui_post(port, endpoint, directory, body)
+local function send_key_to_pane(pane_id, key)
 	local Promise = require("opencode.promise")
-
 	return Promise.new(function(resolve, reject)
 		local stderr_lines = {}
-
-		local command = {
-			"curl",
-			"-s",
-			"-X",
-			"POST",
-			"-H",
-			"Content-Type: application/json",
-			"-H",
-			"Accept: application/json",
-			"-H",
-			"x-opencode-directory: " .. directory,
-			"--max-time",
-			"2",
-		}
-
-		if body then
-			table.insert(command, "-d")
-			table.insert(command, vim.fn.json_encode(body))
-		end
-
-		table.insert(command, "http://localhost:" .. tostring(port) .. endpoint)
-
-		vim.fn.jobstart(command, {
+		vim.fn.jobstart({ "tmux", "send-keys", "-t", pane_id, key }, {
 			on_stderr = function(_, data)
 				if not data then
 					return
@@ -54,21 +28,83 @@ local function tui_post(port, endpoint, directory, body)
 					return
 				end
 				local stderr_message = #stderr_lines > 0 and table.concat(stderr_lines, "\n") or "<none>"
-				reject("Failed POST " .. endpoint .. " (" .. tostring(code) .. "): " .. stderr_message)
+				reject("Failed tmux send-keys " .. tostring(key) .. " (" .. tostring(code) .. "): " .. stderr_message)
 			end,
 		})
 	end)
 end
 
----@param port number
----@param fallback_directory string
+---@param pane_id string
+---@param text string
 ---@return Promise
-local function get_target_directory(port, fallback_directory)
+local function send_literal_to_pane(pane_id, text)
 	local Promise = require("opencode.promise")
+	return Promise.new(function(resolve, reject)
+		local stderr_lines = {}
+		vim.fn.jobstart({ "tmux", "send-keys", "-t", pane_id, "-l", text }, {
+			on_stderr = function(_, data)
+				if not data then
+					return
+				end
+				for _, line in ipairs(data) do
+					if line ~= "" then
+						table.insert(stderr_lines, line)
+					end
+				end
+			end,
+			on_exit = function(_, code)
+				if code == 0 then
+					resolve(true)
+					return
+				end
+				local stderr_message = #stderr_lines > 0 and table.concat(stderr_lines, "\n") or "<none>"
+				reject("Failed tmux send-keys -l (" .. tostring(code) .. "): " .. stderr_message)
+			end,
+		})
+	end)
+end
+
+---@param pane_id string
+---@param text string
+---@return Promise
+local function send_text_to_pane(pane_id, text)
+	local Promise = require("opencode.promise")
+	if text == "" then
+		return Promise.resolve(true)
+	end
+
+	local lines = vim.split(text, "\n", { plain = true })
+	local chain = Promise.resolve(true)
+	for i, line in ipairs(lines) do
+		chain = chain:next(function()
+			return send_literal_to_pane(pane_id, line)
+		end)
+		if i < #lines then
+			chain = chain:next(function()
+				return send_key_to_pane(pane_id, "C-j")
+			end)
+		end
+	end
+
+	return chain
+end
+
+---@param targets table[]
+---@return Promise
+local function select_target_pane(targets)
+	local Promise = require("opencode.promise")
+	if #targets == 1 then
+		return Promise.resolve(targets[1])
+	end
 
 	return Promise.new(function(resolve)
-		discovery.target_directory_for_port_async(port, fallback_directory, function(directory)
-			resolve(directory)
+		vim.schedule(function()
+			vim.ui.select(targets, {
+				prompt = "Send to opencode pane",
+				format_item = discovery.format_pane_target_label,
+			}, function(choice)
+				resolve(choice)
+			end)
 		end)
 	end)
 end
@@ -122,7 +158,12 @@ local function sse_subscribe_global(port, target_directory, target_session_id, o
 			end
 
 			local event_directory = response.directory
-			if target_directory and target_directory ~= "" and event_directory and event_directory ~= target_directory then
+			if
+				target_directory
+				and target_directory ~= ""
+				and event_directory
+				and event_directory ~= target_directory
+			then
 				return
 			end
 
@@ -216,6 +257,74 @@ function M.apply()
 		return sse_subscribe_global(port, target_directory, target_session_id, on_success, on_error)
 	end
 
+	---@param server_item opencode.cli.server.Server
+	---@param session_id string|nil
+	---@param target_dir string|nil
+	---@param target_pane table|nil
+	---@return opencode.cli.server.Server
+	local function ensure_connected(server_item, session_id, target_dir, target_pane)
+		local connected_server = events.connected_server
+		local previous_target_dir = state.sse_target_directory_by_port[server_item.port]
+		local previous_session_id = state.sse_target_session_id_by_port[server_item.port]
+		local previous_pane = state.sse_target_pane_by_port[server_item.port]
+		if not target_dir or target_dir == "" then
+			target_dir = server_item.cwd
+		end
+		state.sse_target_directory_by_port[server_item.port] = target_dir
+		state.sse_target_session_id_by_port[server_item.port] = session_id
+		state.sse_target_pane_by_port[server_item.port] = target_pane
+		system.debug(
+			"Resolved target"
+				.. " port="
+				.. tostring(server_item.port)
+				.. " directory="
+				.. tostring(target_dir)
+				.. " session_id="
+				.. tostring(session_id)
+				.. " pane_id="
+				.. tostring(target_pane and target_pane.pane_id or nil)
+		)
+		local now = vim.uv.now()
+		local last_event_age_ms = state.last_event_ms and (now - state.last_event_ms) or nil
+		local has_recent_events = last_event_age_ms ~= nil and last_event_age_ms <= 35000
+		local target_unchanged = previous_target_dir == target_dir
+			and previous_session_id == session_id
+			and (previous_pane and previous_pane.pane_id or nil) == (target_pane and target_pane.pane_id or nil)
+		if connected_server and connected_server.port == server_item.port then
+			if has_recent_events and target_unchanged then
+				system.debug(
+					"Reusing existing SSE connection on port "
+						.. tostring(server_item.port)
+						.. " last_event="
+						.. tostring(state.last_event_type)
+						.. " age_ms="
+						.. tostring(last_event_age_ms)
+				)
+				return server_item
+			end
+
+			system.debug(
+				"SSE health unknown/stale or target changed for current port; reconnecting"
+					.. " port="
+					.. tostring(server_item.port)
+					.. " age_ms="
+					.. tostring(last_event_age_ms)
+					.. " target_unchanged="
+					.. tostring(target_unchanged)
+			)
+		end
+
+		system.debug(
+			"Connecting SSE stream"
+				.. " old="
+				.. tostring(connected_server and connected_server.port or "nil")
+				.. " new="
+				.. tostring(server_item.port)
+		)
+		events.connect(server_item)
+		return server_item
+	end
+
 	server.get_all = function(...)
 		local Promise = require("opencode.promise")
 		local original = state.original_get_all(...)
@@ -272,53 +381,9 @@ function M.apply()
 		local server_opts = require("opencode.config").opts.server or {}
 
 		local function connect(server_item)
-			local connected_server = events.connected_server
 			local session_id, target_dir = discovery.resolve_target_session(server_item.port, server_item.cwd)
-			if not target_dir or target_dir == "" then
-				target_dir = server_item.cwd
-			end
-			state.sse_target_directory_by_port[server_item.port] = target_dir
-			state.sse_target_session_id_by_port[server_item.port] = session_id
-			system.debug(
-				"Resolved target"
-					.. " port=" .. tostring(server_item.port)
-					.. " directory=" .. tostring(target_dir)
-					.. " session_id=" .. tostring(session_id)
-			)
-			local now = vim.uv.now()
-			local last_event_age_ms = state.last_event_ms and (now - state.last_event_ms) or nil
-			local has_recent_events = last_event_age_ms ~= nil and last_event_age_ms <= 35000
-			if connected_server and connected_server.port == server_item.port then
-				if has_recent_events then
-					system.debug(
-						"Reusing existing SSE connection on port "
-							.. tostring(server_item.port)
-							.. " last_event="
-							.. tostring(state.last_event_type)
-							.. " age_ms="
-							.. tostring(last_event_age_ms)
-					)
-					return server_item
-				end
-
-				system.debug(
-					"SSE health unknown/stale for current port; reconnecting"
-						.. " port="
-						.. tostring(server_item.port)
-						.. " age_ms="
-						.. tostring(last_event_age_ms)
-				)
-			end
-
-			system.debug(
-				"Connecting SSE stream"
-					.. " old="
-					.. tostring(connected_server and connected_server.port or "nil")
-					.. " new="
-					.. tostring(server_item.port)
-			)
-			events.connect(server_item)
-			return server_item
+			local target_pane = discovery.target_pane_for_port(server_item.port)
+			return ensure_connected(server_item, session_id, target_dir, target_pane)
 		end
 
 		local function pick_sibling_candidate()
@@ -387,6 +452,7 @@ function M.apply()
 		opts = {
 			clear = opts and opts.clear or false,
 			submit = opts and opts.submit or false,
+			new = opts and opts.new or false,
 			context = opts and opts.context or require("opencode.context").new(),
 		}
 
@@ -396,117 +462,63 @@ function M.apply()
 		end
 
 		local Promise = require("opencode.promise")
-		return require("opencode.cli.server")
-			.get()
-			:catch(function()
-				system.debug("Failed to resolve server via sibling-aware flow; using original prompt")
-				return nil
-			end)
-			:next(function(server_item)
-				if not server_item then
-					system.debug("No server resolved; falling back to original prompt")
-					return state.original_prompt(prompt_text, opts)
+		local pane_targets = discovery.sibling_pane_targets()
+		if #pane_targets == 0 then
+			system.debug("No sibling pane targets resolved; falling back to original prompt")
+			return state.original_prompt(prompt_text, opts)
+		end
+
+		return select_target_pane(pane_targets)
+			:next(function(target_pane)
+				if not target_pane then
+					opts.context:resume()
+					return nil
 				end
 
-				local target_session_id = state.sse_target_session_id_by_port[server_item.port]
-				local target_directory = state.sse_target_directory_by_port[server_item.port]
-					or discovery.target_directory_for_port(server_item.port, server_item.cwd)
+				return discovery.get_server(target_pane.port):next(function(server_item)
+					local session_id, target_dir =
+						discovery.resolve_target_session_for_pane(target_pane, server_item.cwd)
+					ensure_connected(server_item, session_id, target_dir, target_pane)
 
-				-- If we have a session ID, send directly via the session message API
-				if target_session_id and opts.submit then
 					local rendered = opts.context:render(prompt_text, server_item.subagents)
 					local plaintext = opts.context.plaintext(rendered.output)
-
-					if plaintext == "" then
-						system.debug("Empty prompt text; skipping direct message send")
-						opts.context:clear()
-						return server_item
-					end
-
-					system.debug(
-						"Sending message directly to session"
-							.. " port=" .. tostring(server_item.port)
-							.. " session=" .. tostring(target_session_id)
-							.. " directory=" .. tostring(target_directory)
-					)
-
-					return Promise.new(function(resolve, reject)
-						local body = vim.fn.json_encode({
-							parts = {
-								{
-									type = "text",
-									text = plaintext,
-								},
-							},
-						})
-
-						local stderr_lines = {}
-						local command = {
-							"curl", "-s", "-X", "POST",
-							"-H", "Content-Type: application/json",
-							"-H", "Accept: application/json",
-							"-H", "x-opencode-directory: " .. (target_directory or server_item.cwd),
-							"--max-time", "120",
-							"-d", body,
-							"http://localhost:" .. tostring(server_item.port)
-								.. "/session/" .. target_session_id .. "/message",
-						}
-
-						vim.fn.jobstart(command, {
-							on_stderr = function(_, data)
-								if not data then return end
-								for _, line in ipairs(data) do
-									if line ~= "" then table.insert(stderr_lines, line) end
-								end
-							end,
-							on_exit = function(_, code)
-								if code == 0 then
-									resolve(server_item)
-								else
-									local msg = #stderr_lines > 0 and table.concat(stderr_lines, "\n") or "<none>"
-									reject("Direct message failed (" .. tostring(code) .. "): " .. msg)
-								end
-							end,
-						})
-					end)
-				end
-
-				-- Fallback: route through TUI endpoints (no session ID or no submit)
-				local rendered = opts.context:render(prompt_text, server_item.subagents)
-				local plaintext = opts.context.plaintext(rendered.output)
-
-				return get_target_directory(server_item.port, server_item.cwd):next(function(directory)
-					if not directory or directory == "" then
-						system.debug("No target directory resolved; falling back to original prompt")
-						return state.original_prompt(prompt_text, opts)
-					end
-
 					local chain = Promise.resolve(true)
+
+					if opts.new then
+						chain = chain:next(function()
+							return send_key_to_pane(target_pane.pane_id, "C-x")
+						end):next(function()
+							return send_key_to_pane(target_pane.pane_id, "n")
+						end)
+					end
 
 					if opts.clear then
 						chain = chain:next(function()
-							return tui_post(server_item.port, "/tui/clear-prompt", directory, nil)
+							return send_key_to_pane(target_pane.pane_id, "C-k")
 						end)
 					end
 
 					if plaintext ~= "" then
 						chain = chain:next(function()
-							return tui_post(server_item.port, "/tui/append-prompt", directory, { text = plaintext })
+							return send_text_to_pane(target_pane.pane_id, plaintext)
 						end)
 					end
 
 					if opts.submit then
 						chain = chain:next(function()
-							return tui_post(server_item.port, "/tui/submit-prompt", directory, nil)
+							return send_key_to_pane(target_pane.pane_id, "Enter")
 						end)
 					end
 
 					return chain:next(function()
 						system.debug(
-							"Routed prompt via TUI endpoints on port "
+							"Routed prompt via tmux send-keys"
+								.. " port="
 								.. tostring(server_item.port)
-								.. " directory="
-								.. directory
+								.. " pane="
+								.. tostring(target_pane.pane_id)
+								.. " new="
+								.. tostring(opts.new)
 								.. " submit="
 								.. tostring(opts.submit)
 						)
@@ -514,8 +526,11 @@ function M.apply()
 					end)
 				end)
 			end)
-			:next(function()
-				opts.context:clear()
+			:next(function(server_item)
+				if server_item then
+					opts.context:clear()
+				end
+				return server_item
 			end)
 			:catch(function(err)
 				opts.context:resume()

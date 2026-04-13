@@ -9,7 +9,7 @@ It provides tmux-backed server management with sibling-aware patching and helper
 - **tmux-backed `server.start/stop/toggle`** — opens opencode in a tmux split pane
 - **toggle with persist** — when `auto_close = false` (default), toggling hides/restores the pane instead of killing it, preserving your opencode session
 - **sibling-pane discovery** — finds opencode servers running in other panes of the same tmux window
-- **server/prompt patching** — patches `opencode.cli.server` and prompt routing so built-in `opencode.nvim` flows use sibling-first behavior
+- **server/prompt patching** — patches `opencode.cli.server` and prompt routing so connect stays sibling-first while prompt send opens a sibling-pane picker
 - **session-scoped isolation** — subscribes via `/global/event` and filters by directory + session ID; sends prompts directly via `/session/:id/message` to target the exact attached session
 - **wrapper APIs** — explicit `connect()`, `prompt()`, and `servers()` helpers for direct usage
 
@@ -61,13 +61,14 @@ These helpers are exported in addition to the patched default behavior:
 
 ```lua
 require("opencode-tmux").connect()
-require("opencode-tmux").prompt("Fix failing tests", { submit = true })
+require("opencode-tmux").prompt("Fix failing tests", { new = true, submit = true })
 require("opencode-tmux").servers()
 ```
 
 - `connect()` uses `connect_launch` by default.
 - `connect({ launch = true })` overrides the default and allows launching a new tmux-managed server.
-- `prompt()` renders context and posts to the active sibling server TUI endpoints.
+- `prompt()` renders context, asks which sibling opencode pane to target, then sends there via tmux.
+- `prompt(..., { new = true })` sends `Ctrl+x` then `n` before any other prompt keys/text.
 - `servers()` returns discovered sibling servers (unique by port).
 
 
@@ -77,6 +78,7 @@ When `find_sibling = true`, the plugin scans all panes in the current tmux windo
 
 - Built-in `opencode.nvim` flows use sibling-first behavior through patched server discovery/routing.
 - `connect()` and `prompt()` can also be called directly for explicit control.
+- `connect()` still auto-targets the inferred sibling pane/session, while prompt sending asks you to choose from sibling opencode panes shown as `[pane_index] Title`.
 - If no sibling server is found and launching is enabled, connect starts a tmux-managed split and retries discovery.
 
 ## Toggle behavior

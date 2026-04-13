@@ -16,14 +16,23 @@ end
 ---@param server_item opencode.cli.server.Server
 local function notify_connected(server_item)
 	local port = server_item and server_item.port or "?"
-	local title = server_item and server_item.title or nil
-	if not title or title == "" or title == "<No sessions>" then
-		title = state.sse_target_session_id_by_port[port]
+	local pane = state.sse_target_pane_by_port[port]
+	local pane_label = nil
+	if pane and pane.pane_id then
+		local pane_spec = system.run({
+			"tmux",
+			"display-message",
+			"-p",
+			"-t",
+			pane.pane_id,
+			"[#{pane_index}]",
+		})
+		pane_label = pane_spec ~= "" and pane_spec or pane.pane_id
 	end
-	if not title or title == "" then
-		title = server_item and server_item.cwd or "<unknown>"
+	if not pane_label or pane_label == "" then
+		pane_label = "<unknown pane>"
 	end
-	vim.notify("Connected to session: " .. tostring(title) .. " (port " .. tostring(port) .. ")")
+	vim.notify("Connected to: " .. tostring(pane_label) .. " (port " .. tostring(port) .. ")")
 end
 
 ---@param value any
@@ -82,11 +91,11 @@ end
 ---@field connect_keymap? string|false
 ---@field connect_launch? boolean
 
----@param opts? { launch?: boolean }
+---@param opts? { launch?: boolean, notify_failure?: boolean }
 ---@return Promise|nil
 function M.connect(opts)
 	debug_call("connect", opts)
-	local ok, Promise = pcall(require, "opencode.promise")
+	local ok, _ = pcall(require, "opencode.promise")
 	if not ok then
 		system.notify("opencode.nvim is required", vim.log.levels.ERROR)
 		return nil
@@ -95,8 +104,12 @@ function M.connect(opts)
 
 	opts = opts or {}
 	local launch = opts.launch
+	local notify_failure = opts.notify_failure
 	if launch == nil then
 		launch = state.opts.connect_launch == true
+	end
+	if notify_failure == nil then
+		notify_failure = true
 	end
 
 	local promise = server.get(launch):next(function(server_item)
@@ -105,7 +118,11 @@ function M.connect(opts)
 	end)
 
 	promise = promise:catch(function(err)
-		system.notify(tostring(err), vim.log.levels.ERROR)
+		if notify_failure then
+			system.notify(tostring(err), vim.log.levels.ERROR)
+		else
+			system.debug("connect failed: " .. tostring(err))
+		end
 		return nil
 	end)
 
@@ -113,124 +130,22 @@ function M.connect(opts)
 end
 
 ---@param prompt_text string
----@param opts? { clear?: boolean, submit?: boolean, context?: opencode.Context }
+---@param opts? { clear?: boolean, submit?: boolean, new?: boolean, context?: opencode.Context }
 ---@return Promise|nil
 function M.prompt(prompt_text, opts)
 	debug_call("prompt", {
 		prompt_text = prompt_text,
 		clear = opts and opts.clear or false,
 		submit = opts and opts.submit or false,
+		new = opts and opts.new or false,
 		has_context = opts and opts.context ~= nil or false,
 	})
-	local ok, Promise = pcall(require, "opencode.promise")
+	local ok, _ = pcall(require, "opencode.promise")
 	if not ok then
 		system.notify("opencode.nvim is required", vim.log.levels.ERROR)
 		return nil
 	end
-
-	opts = {
-		clear = opts and opts.clear or false,
-		submit = opts and opts.submit or false,
-		context = opts and opts.context or require("opencode.context").new(),
-	}
-
-	local function tui_post(port, endpoint, directory, body)
-		debug_call("tui_post", {
-			port = port,
-			endpoint = endpoint,
-			directory = directory,
-			body = body,
-		})
-		return Promise.new(function(resolve, reject)
-			local stderr_lines = {}
-			local command = {
-				"curl",
-				"-s",
-				"-X",
-				"POST",
-				"-H",
-				"Content-Type: application/json",
-				"-H",
-				"Accept: application/json",
-				"-H",
-				"x-opencode-directory: " .. directory,
-				"--max-time",
-				"2",
-			}
-
-			if body then
-				table.insert(command, "-d")
-				table.insert(command, vim.fn.json_encode(body))
-			end
-
-			table.insert(command, "http://localhost:" .. tostring(port) .. endpoint)
-
-			vim.fn.jobstart(command, {
-				on_stderr = function(_, data)
-					if not data then
-						return
-					end
-					for _, line in ipairs(data) do
-						if line ~= "" then
-							table.insert(stderr_lines, line)
-						end
-					end
-				end,
-				on_exit = function(_, code)
-					if code == 0 then
-						resolve(true)
-						return
-					end
-					local stderr_message = #stderr_lines > 0 and table.concat(stderr_lines, "\n") or "<none>"
-					reject("Failed POST " .. endpoint .. " (" .. tostring(code) .. "): " .. stderr_message)
-				end,
-			})
-		end)
-	end
-
-	return M.connect({ launch = state.opts.connect_launch })
-		:next(function(server_item)
-			if not server_item then
-				return nil
-			end
-
-			local rendered = opts.context:render(prompt_text, server_item.subagents)
-			local plaintext = opts.context.plaintext(rendered.output)
-
-			return Promise.new(function(resolve)
-				discovery.target_directory_for_port_async(server_item.port, server_item.cwd, resolve)
-			end):next(function(directory)
-				if not directory or directory == "" then
-					error("No target directory resolved for sibling server", 0)
-				end
-
-				local chain = Promise.resolve(true)
-				if opts.clear then
-					chain = chain:next(function()
-						return tui_post(server_item.port, "/tui/clear-prompt", directory, nil)
-					end)
-				end
-				if plaintext ~= "" then
-					chain = chain:next(function()
-						return tui_post(server_item.port, "/tui/append-prompt", directory, { text = plaintext })
-					end)
-				end
-				if opts.submit then
-					chain = chain:next(function()
-						return tui_post(server_item.port, "/tui/submit-prompt", directory, nil)
-					end)
-				end
-				return chain
-			end)
-		end)
-		:next(function(result)
-			opts.context:clear()
-			return result
-		end)
-		:catch(function(err)
-			opts.context:resume()
-			return Promise.reject(err)
-		end)
+	return require("opencode.api.prompt").prompt(prompt_text, opts)
 end
 
 ---@return Promise|nil
@@ -299,7 +214,7 @@ function M.setup(opts)
 						filepath = "."
 					end
 				end
-				vim.notify("opencode-tmux: file.edited: " .. tostring(filepath), vim.log.levels.INFO, {
+				vim.notify("Opencode edited " .. tostring(filepath), vim.log.levels.INFO, {
 					title = "opencode",
 				})
 			end
