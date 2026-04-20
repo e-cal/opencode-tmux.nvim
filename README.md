@@ -1,5 +1,7 @@
 # opencode-tmux.nvim
 
+> NOTE: archived in favour of a more general purpose nvim - tmux - agent bridge plugin: https://github.com/e-cal/tmux-agent-bridge.nvim
+
 Tmux extension for [`opencode.nvim`](https://github.com/NickvanDyke/opencode.nvim).
 
 `opencode.nvim` is required. This plugin does not work standalone. When not running inside tmux, it silently no-ops.
